@@ -150,7 +150,7 @@ def verify_dataset_integrity(folder: str, num_processes: int = 8) -> None:
     file_ending = dataset_json['file_ending']
 
     dataset = get_filenames_of_train_images_and_targets(folder, dataset_json)
-
+    
     # check if the right number of training cases is present
     assert len(dataset) == expected_num_training, 'Did not find the expected number of training cases ' \
                                                                '(%d). Found %d instead.\nExamples: %s' % \

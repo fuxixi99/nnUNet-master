@@ -24,7 +24,9 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 from torch.cuda.amp import autocast
-
+import torch.nn.functional as F
+from torch.nn.modules.conv import _ConvNd
+from torch.nn.modules.dropout import _DropoutNd
 
 class FEM(nn.Module):
     def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
@@ -161,9 +163,34 @@ class BasicConv(nn.Module):
         if self.relu is not None:
             x = self.relu(x)
         return x
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ASPP, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool3d(1)  # 适用于3D
+        self.conv1x1_1 = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        self.atrous_block1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, dilation=1)
+        self.atrous_block6 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=6, dilation=6)
+        self.atrous_block12 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=12, dilation=12)
+        self.atrous_block18 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=18, dilation=18)
+        self.conv1x1_2 = nn.Conv3d(out_channels * 5, out_channels, kernel_size=1)
 
+    def forward(self, x):
+        size = x.shape[2:]  # 获取空间维度 (D, H, W)
 
-class FemPlainConvUNet(nn.Module):
+        global_avg = self.global_avg_pool(x)
+        global_avg = self.conv1x1_1(global_avg)
+        global_avg = F.interpolate(global_avg, size=size, mode="trilinear", align_corners=False)
+
+        atrous_block1 = self.atrous_block1(x)
+        atrous_block6 = self.atrous_block6(x)
+        atrous_block12 = self.atrous_block12(x)
+        atrous_block18 = self.atrous_block18(x)
+
+        x = torch.cat([global_avg, atrous_block1, atrous_block6, atrous_block12, atrous_block18], dim=1)
+        x = self.conv1x1_2(x)
+        return x
+
+class FemAsppPlainConvUNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -234,6 +261,7 @@ class FemPlainConvUNet(nn.Module):
         self.FEM = nn.ModuleList(
             [FEM(features, features) for features in self.encoder.output_channels]
         )
+        self.aspp=ASPP(320,320)
 
     def forward(self, x):
         # 编码阶段
@@ -246,7 +274,7 @@ class FemPlainConvUNet(nn.Module):
             ll = fem(skip)  # 应用 FEM 模块
             enhanced_skip = ll + skip
             enhanced_skips.append(enhanced_skip)
-
+        enhanced_skips[-1]=self.aspp(enhanced_skips[-1])
         # 解码阶段
         outputs = self.decoder(enhanced_skips)
         return outputs
@@ -439,7 +467,7 @@ class ResidualUNet(nn.Module):
 if __name__ == "__main__":
     data = torch.rand((1, 1, 128, 128, 128))
 
-    model = FemPlainConvUNet(
+    model = FemAsppPlainConvUNet(
         1,
         6,
         (32, 64, 125, 256, 320, 320),

@@ -1,6 +1,11 @@
 from typing import Union, Type, List, Tuple
 
 import torch
+import torch
+from torch import nn
+import torch.nn.functional as F
+import SimpleITK as sitk
+import os
 from dynamic_network_architectures.building_blocks.helper import convert_conv_op_to_dim
 from dynamic_network_architectures.building_blocks.plain_conv_encoder import (
     PlainConvEncoder,
@@ -26,144 +31,133 @@ from torch.nn.modules.dropout import _DropoutNd
 from torch.cuda.amp import autocast
 
 
-class FEM(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
-        super(FEM, self).__init__()
-        self.scale = scale
-        self.out_channels = out_planes
-        inter_planes = in_planes // map_reduce
-        self.branch0 = nn.Sequential(
-            BasicConv(in_planes, 2 * inter_planes, kernel_size=1, stride=stride),
-            BasicConv(
-                2 * inter_planes,
-                2 * inter_planes,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                relu=False,
-            ),
-        )
-        self.branch1 = nn.Sequential(
-            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
-            BasicConv(
-                inter_planes,
-                (inter_planes // 2) * 3,
-                kernel_size=(1, 3, 3),
-                stride=stride,
-                padding=(0, 1, 1),
-            ),
-            BasicConv(
-                (inter_planes // 2) * 3,
-                2 * inter_planes,
-                kernel_size=(3, 1, 1),
-                stride=stride,
-                padding=(1, 0, 0),
-            ),
-            BasicConv(
-                2 * inter_planes,
-                2 * inter_planes,
-                kernel_size=3,
-                stride=1,
-                padding=5,
-                dilation=5,
-                relu=False,
-            ),
-        )
-        self.branch2 = nn.Sequential(
-            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
-            BasicConv(
-                inter_planes,
-                (inter_planes // 2) * 3,
-                kernel_size=(3, 1, 1),
-                stride=stride,
-                padding=(1, 0, 0),
-            ),
-            BasicConv(
-                (inter_planes // 2) * 3,
-                2 * inter_planes,
-                kernel_size=(1, 3, 3),
-                stride=stride,
-                padding=(0, 1, 1),
-            ),
-            BasicConv(
-                2 * inter_planes,
-                2 * inter_planes,
-                kernel_size=3,
-                stride=1,
-                padding=5,
-                dilation=5,
-                relu=False,
-            ),
-        )
+class DynamicPositioningAttention3D(nn.Module):
+    def __init__(self, in_channels, num_groups=8, save_dir="./attention_output"):
+        """
+        Dynamic Positioning Attention for 3D input.
 
-        self.ConvLinear = BasicConv(
-            6 * inter_planes, out_planes, kernel_size=1, stride=1, relu=False
-        )
-        self.shortcut = BasicConv(
-            in_planes, out_planes, kernel_size=1, stride=stride, relu=False
-        )
-        self.relu = nn.ReLU(inplace=False)
+        Args:
+            in_channels (int): Number of input channels.
+            num_groups (int): Number of groups for channel grouping.
+            save_dir (str): Directory to save attention weights as .nii.gz files.
+        """
+        super(DynamicPositioningAttention3D, self).__init__()
+        self.in_channels = in_channels
+        self.num_groups = num_groups
+        self.save_dir = save_dir
+        # os.makedirs(save_dir, exist_ok=True)
 
-    def forward(self, x):
+        # Linear projections for Q, K, V
+        self.query_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.key_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.value_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
 
-        x0 = self.branch0(x)
-        x1 = self.branch1(x)
-        x2 = self.branch2(x)
+        # Output projection
+        self.output_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
 
-        out = torch.cat((x0, x1, x2), 1)
-        out = self.ConvLinear(out)
-        short = self.shortcut(x)
-        out = out * self.scale + short
-        out = self.relu(out)
+    def forward(self, x, save_name="attention_weights"):
+        """
+        Forward pass of the module.
 
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, D, H, W).
+            save_name (str): Base name for saving attention weights.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C, D, H, W).
+        """
+        B, C, D, H, W = x.shape
+
+        # Generate Q, K, V
+        Q = self.query_conv(x)  # Query projection
+        K = self.key_conv(x)    # Key projection
+        V = self.value_conv(x)  # Value projection
+
+        # Compute average Q for masking
+        avg_Q = Q.mean(dim=(2, 3, 4), keepdim=True)
+        significant_mask = Q >= avg_Q
+        A_S = significant_mask.float()
+
+        # Apply Laplacian filter for edge detection
+        laplacian_kernel = torch.tensor([[[[0, 0, 0],
+                                           [0, -1, 0],
+                                           [0, 1, 0]],
+                                          [[0, 0, 0],
+                                           [-1, 4, -1],
+                                           [0, 0, 0]],
+                                          [[0, 0, 0],
+                                           [0, -1, 0],
+                                           [0, 1, 0]]]]).repeat(C, 1, 1, 1, 1).to(x.device)
+        # 确保权重类型与 A_S 类型一致
+        laplacian_kernel = laplacian_kernel.to(A_S.dtype)
+        edge_detected = F.conv3d(A_S, weight=laplacian_kernel, padding=1, groups=C)
+        contour_locations = edge_detected > 0  # Binary mask for contours
+
+        # Create dynamic windows based on contour locations
+        dynamic_window = contour_locations.float()
+
+        # Apply dynamic windows to Q, K, V
+        Q_dw = Q * dynamic_window
+        K_dw = K * dynamic_window
+        V_dw = V * dynamic_window
+
+        # Compute attention scores
+        attention_scores = torch.einsum('bcxyz,bcxyz->bxyz', Q_dw, K_dw)
+        attention_scores = attention_scores / (C ** 0.5)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        # Attention application
+        attention_output = attention_weights.unsqueeze(1) * V_dw
+
+        # Save attention weights as .nii.gz
+        # self.save_attention_weights(attention_weights, save_name)
+
+        # Output projection
+        out = self.output_conv(attention_output)
         return out
 
+    def save_attention_weights(self, attention_weights, save_name):
+        """
+        Save attention weights as .nii.gz images.
 
-class BasicConv(nn.Module):
-    def __init__(
-        self,
-        in_planes,
-        out_planes,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        relu=True,
-        bn=True,
-        bias=False,
-    ):
-        super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv3d(
-            in_planes,
-            out_planes,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-        )
-        self.bn = (
-            nn.BatchNorm3d(out_planes, eps=1e-5, momentum=0.01, affine=True)
-            if bn
-            else None
-        )
-        self.relu = nn.ReLU(inplace=True) if relu else None
+        Args:
+            attention_weights (torch.Tensor): Attention weights of shape (B, D, H, W).
+            save_name (str): Base name for saving the weights.
+        """
+        attention_weights_np = attention_weights.detach().cpu().numpy()
 
-    def forward(self, x):
-
-        x = self.conv(x)
-
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
+        for i in range(attention_weights_np.shape[0]):
+            sitk_image = sitk.GetImageFromArray(attention_weights_np[i])
+            file_name = os.path.join(self.save_dir, f"{save_name}_batch_{i}.nii.gz")
+            sitk.WriteImage(sitk_image, file_name)
+            print(f"Saved attention weights for batch {i} to {file_name}")
 
 
-class FemPlainConvUNet(nn.Module):
+def load_nii_image_as_tensor(file_path, device="cuda"):
+    """
+    Load a .nii.gz file and convert it to a PyTorch tensor.
+
+    Args:
+        file_path (str): Path to the .nii.gz file.
+        device (str): Device to load the tensor on, default is "cuda".
+
+    Returns:
+        torch.Tensor: 3D image tensor with shape (1, C, D, H, W).
+    """
+    # Load the image using SimpleITK
+    sitk_image = sitk.ReadImage(file_path)
+    image_array = sitk.GetArrayFromImage(sitk_image)  # Shape: (D, H, W)
+
+    # Normalize and convert to PyTorch tensor
+    image_tensor = torch.tensor(image_array, dtype=torch.float32, device=device)
+    image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
+    image_tensor = image_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+
+    return image_tensor
+
+
+
+class DynamicPlainConvUNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -231,8 +225,8 @@ class FemPlainConvUNet(nn.Module):
         )
 
         # 初始化 FEM 模块
-        self.FEM = nn.ModuleList(
-            [FEM(features, features) for features in self.encoder.output_channels]
+        self.dynamic_net = nn.ModuleList(
+            [DynamicPositioningAttention3D(in_channels=features) for features in self.encoder.output_channels]
         )
 
     def forward(self, x):
@@ -241,9 +235,9 @@ class FemPlainConvUNet(nn.Module):
 
         # 增强 skip 连接
         enhanced_skips = []
-        for skip, fem in zip(skips, self.FEM):
+        for skip, dyn in zip(skips, self.dynamic_net):
             skip = skip.float()  # 确保输入为 float32
-            ll = fem(skip)  # 应用 FEM 模块
+            ll = dyn(skip)  # 应用 FEM 模块
             enhanced_skip = ll + skip
             enhanced_skips.append(enhanced_skip)
 
@@ -439,7 +433,7 @@ class ResidualUNet(nn.Module):
 if __name__ == "__main__":
     data = torch.rand((1, 1, 128, 128, 128))
 
-    model = FemPlainConvUNet(
+    model = DynamicPlainConvUNet(
         1,
         6,
         (32, 64, 125, 256, 320, 320),

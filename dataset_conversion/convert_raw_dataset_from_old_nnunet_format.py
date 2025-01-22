@@ -52,4 +52,5 @@ def convert_entry_point():
     args = parser.parse_args()
     convert(args.input_folder, args.output_dataset_name)
 if __name__ == "__main__":
-    convert('C:/Users/B507/Desktop/hufei/med-sam-adapter/nnUNet-master/nnUNetFrame/DATASET/nnUNet_raw/nnUNet_raw_data/Task502_NPC','Task502_NPC')
+    # convert('C:/Users/B507/Desktop/hufei/med-sam-adapter/nnUNet-master/nnUNetFrame/DATASET/nnUNet_raw/nnUNet_raw_data/Task502_NPC','Task502_NPC')
+    convert('C:/Users/B507/Desktop/hufei/med-sam-adapter/nnUNet-master/nnUNetFrame/DATASET/nnUNet_raw/nnUNet_raw_data/Task503_Segrap2023','Task503_Segrap2023')

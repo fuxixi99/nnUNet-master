@@ -24,6 +24,141 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 from torch.cuda.amp import autocast
+import torch.nn.functional as F
+from torch.nn.modules.conv import _ConvNd
+from torch.nn.modules.dropout import _DropoutNd
+
+from torch import nn
+from torch.nn.modules.conv import _ConvNd
+from torch.nn.modules.dropout import _DropoutNd
+from torch.cuda.amp import autocast
+
+
+class DynamicPositioningAttention3D(nn.Module):
+    def __init__(self, in_channels, num_groups=8, save_dir="./attention_output"):
+        """
+        Dynamic Positioning Attention for 3D input.
+
+        Args:
+            in_channels (int): Number of input channels.
+            num_groups (int): Number of groups for channel grouping.
+            save_dir (str): Directory to save attention weights as .nii.gz files.
+        """
+        super(DynamicPositioningAttention3D, self).__init__()
+        self.in_channels = in_channels
+        self.num_groups = num_groups
+        self.save_dir = save_dir
+        # os.makedirs(save_dir, exist_ok=True)
+
+        # Linear projections for Q, K, V
+        self.query_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.key_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.value_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+
+        # Output projection
+        self.output_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+
+    def forward(self, x, save_name="attention_weights"):
+        """
+        Forward pass of the module.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, D, H, W).
+            save_name (str): Base name for saving attention weights.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C, D, H, W).
+        """
+        B, C, D, H, W = x.shape
+
+        # Generate Q, K, V
+        Q = self.query_conv(x)  # Query projection
+        K = self.key_conv(x)    # Key projection
+        V = self.value_conv(x)  # Value projection
+
+        # Compute average Q for masking
+        avg_Q = Q.mean(dim=(2, 3, 4), keepdim=True)
+        significant_mask = Q >= avg_Q
+        A_S = significant_mask.float()
+
+        # Apply Laplacian filter for edge detection
+        laplacian_kernel = torch.tensor([[[[0, 0, 0],
+                                           [0, -1, 0],
+                                           [0, 1, 0]],
+                                          [[0, 0, 0],
+                                           [-1, 4, -1],
+                                           [0, 0, 0]],
+                                          [[0, 0, 0],
+                                           [0, -1, 0],
+                                           [0, 1, 0]]]]).repeat(C, 1, 1, 1, 1).to(x.device)
+        # 确保权重类型与 A_S 类型一致
+        laplacian_kernel = laplacian_kernel.to(A_S.dtype)
+        edge_detected = F.conv3d(A_S, weight=laplacian_kernel, padding=1, groups=C)
+        contour_locations = edge_detected > 0  # Binary mask for contours
+
+        # Create dynamic windows based on contour locations
+        dynamic_window = contour_locations.float()
+
+        # Apply dynamic windows to Q, K, V
+        Q_dw = Q * dynamic_window
+        K_dw = K * dynamic_window
+        V_dw = V * dynamic_window
+
+        # Compute attention scores
+        attention_scores = torch.einsum('bcxyz,bcxyz->bxyz', Q_dw, K_dw)
+        attention_scores = attention_scores / (C ** 0.5)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        # Attention application
+        attention_output = attention_weights.unsqueeze(1) * V_dw
+
+        # Save attention weights as .nii.gz
+        # self.save_attention_weights(attention_weights, save_name)
+
+        # Output projection
+        out = self.output_conv(attention_output)
+        return out
+
+    def save_attention_weights(self, attention_weights, save_name):
+        """
+        Save attention weights as .nii.gz images.
+
+        Args:
+            attention_weights (torch.Tensor): Attention weights of shape (B, D, H, W).
+            save_name (str): Base name for saving the weights.
+        """
+        attention_weights_np = attention_weights.detach().cpu().numpy()
+
+        for i in range(attention_weights_np.shape[0]):
+            sitk_image = sitk.GetImageFromArray(attention_weights_np[i])
+            file_name = os.path.join(self.save_dir, f"{save_name}_batch_{i}.nii.gz")
+            sitk.WriteImage(sitk_image, file_name)
+            print(f"Saved attention weights for batch {i} to {file_name}")
+
+
+def load_nii_image_as_tensor(file_path, device="cuda"):
+    """
+    Load a .nii.gz file and convert it to a PyTorch tensor.
+
+    Args:
+        file_path (str): Path to the .nii.gz file.
+        device (str): Device to load the tensor on, default is "cuda".
+
+    Returns:
+        torch.Tensor: 3D image tensor with shape (1, C, D, H, W).
+    """
+    # Load the image using SimpleITK
+    sitk_image = sitk.ReadImage(file_path)
+    image_array = sitk.GetArrayFromImage(sitk_image)  # Shape: (D, H, W)
+
+    # Normalize and convert to PyTorch tensor
+    image_tensor = torch.tensor(image_array, dtype=torch.float32, device=device)
+    image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
+    image_tensor = image_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+
+    return image_tensor
+
+
 
 
 class FEM(nn.Module):
@@ -163,7 +298,7 @@ class BasicConv(nn.Module):
         return x
 
 
-class FemPlainConvUNet(nn.Module):
+class FemDynamicPlainConvUNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -234,6 +369,7 @@ class FemPlainConvUNet(nn.Module):
         self.FEM = nn.ModuleList(
             [FEM(features, features) for features in self.encoder.output_channels]
         )
+        self.dynamic_net=DynamicPositioningAttention3D(320)
 
     def forward(self, x):
         # 编码阶段
@@ -246,7 +382,7 @@ class FemPlainConvUNet(nn.Module):
             ll = fem(skip)  # 应用 FEM 模块
             enhanced_skip = ll + skip
             enhanced_skips.append(enhanced_skip)
-
+        enhanced_skips[-1]=self.dynamic_net(enhanced_skips[-1])
         # 解码阶段
         outputs = self.decoder(enhanced_skips)
         return outputs
@@ -439,7 +575,7 @@ class ResidualUNet(nn.Module):
 if __name__ == "__main__":
     data = torch.rand((1, 1, 128, 128, 128))
 
-    model = FemPlainConvUNet(
+    model = FemDynamicPlainConvUNet(
         1,
         6,
         (32, 64, 125, 256, 320, 320),

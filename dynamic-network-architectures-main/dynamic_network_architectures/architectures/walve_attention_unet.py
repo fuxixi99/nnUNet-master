@@ -1,6 +1,11 @@
 from typing import Union, Type, List, Tuple
 
 import torch
+import torch
+from torch import nn
+import torch.nn.functional as F
+import SimpleITK as sitk
+import os
 from dynamic_network_architectures.building_blocks.helper import convert_conv_op_to_dim
 from dynamic_network_architectures.building_blocks.plain_conv_encoder import (
     PlainConvEncoder,
@@ -26,144 +31,120 @@ from torch.nn.modules.dropout import _DropoutNd
 from torch.cuda.amp import autocast
 
 
-class FEM(nn.Module):
-    def __init__(self, in_planes, out_planes, stride=1, scale=0.1, map_reduce=8):
-        super(FEM, self).__init__()
-        self.scale = scale
-        self.out_channels = out_planes
-        inter_planes = in_planes // map_reduce
-        self.branch0 = nn.Sequential(
-            BasicConv(in_planes, 2 * inter_planes, kernel_size=1, stride=stride),
-            BasicConv(
-                2 * inter_planes,
-                2 * inter_planes,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                relu=False,
-            ),
-        )
-        self.branch1 = nn.Sequential(
-            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
-            BasicConv(
-                inter_planes,
-                (inter_planes // 2) * 3,
-                kernel_size=(1, 3, 3),
-                stride=stride,
-                padding=(0, 1, 1),
-            ),
-            BasicConv(
-                (inter_planes // 2) * 3,
-                2 * inter_planes,
-                kernel_size=(3, 1, 1),
-                stride=stride,
-                padding=(1, 0, 0),
-            ),
-            BasicConv(
-                2 * inter_planes,
-                2 * inter_planes,
-                kernel_size=3,
-                stride=1,
-                padding=5,
-                dilation=5,
-                relu=False,
-            ),
-        )
-        self.branch2 = nn.Sequential(
-            BasicConv(in_planes, inter_planes, kernel_size=1, stride=1),
-            BasicConv(
-                inter_planes,
-                (inter_planes // 2) * 3,
-                kernel_size=(3, 1, 1),
-                stride=stride,
-                padding=(1, 0, 0),
-            ),
-            BasicConv(
-                (inter_planes // 2) * 3,
-                2 * inter_planes,
-                kernel_size=(1, 3, 3),
-                stride=stride,
-                padding=(0, 1, 1),
-            ),
-            BasicConv(
-                2 * inter_planes,
-                2 * inter_planes,
-                kernel_size=3,
-                stride=1,
-                padding=5,
-                dilation=5,
-                relu=False,
-            ),
-        )
+import pywt
 
-        self.ConvLinear = BasicConv(
-            6 * inter_planes, out_planes, kernel_size=1, stride=1, relu=False
+class WaveletTransform3D:
+    """
+    A utility class to perform 3D discrete wavelet transform (DWT) and inverse DWT.
+    """
+    def __init__(self, wavelet='haar'):
+        self.wavelet = pywt.Wavelet(wavelet)
+
+    def dwt3d(self, x):
+        """
+        Perform 3D discrete wavelet transform.
+        
+        Args:
+            x: Input tensor of shape (B, C, D, H, W)
+        
+        Returns:
+            Low-frequency and high-frequency components.
+        """
+        B, C, D, H, W = x.shape
+
+        # Convert tensor to numpy after detaching from computation graph
+        coeffs = [
+            pywt.dwtn(x[b, c].detach().cpu().numpy(), self.wavelet, mode='symmetric')
+            for b in range(B) for c in range(C)
+        ]
+        
+        # Extract low-frequency and high-frequency components
+        low_freq = torch.stack([
+            torch.tensor(c['aaa'], device=x.device, dtype=torch.float32) for c in coeffs
+        ])
+        high_freq = torch.stack([
+            torch.cat([
+                torch.tensor(c[k], device=x.device, dtype=torch.float32).unsqueeze(0)
+                for k in ('aad', 'ada', 'add', 'daa', 'dad', 'dda', 'ddd')
+            ], dim=0) for c in coeffs
+        ])
+        low_freq = low_freq.view(B, C, *low_freq.shape[1:])
+        high_freq = high_freq.view(B, C, -1, *low_freq.shape[2:])
+        return low_freq, high_freq
+
+
+class ChannelAttention(nn.Module):
+    """
+    Channel attention mechanism to enhance feature maps.
+    """
+    def __init__(self, in_channels, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
         )
-        self.shortcut = BasicConv(
-            in_planes, out_planes, kernel_size=1, stride=stride, relu=False
-        )
-        self.relu = nn.ReLU(inplace=False)
 
     def forward(self, x):
+        b, c, _, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1, 1)
+        return x * y
 
-        x0 = self.branch0(x)
-        x1 = self.branch1(x)
-        x2 = self.branch2(x)
+class FeatureFusion(nn.Module):
+    """
+    Feature fusion module to combine low- and high-frequency components.
+    """
+    def __init__(self, low_channels, high_channels):
+        super(FeatureFusion, self).__init__()
+        self.conv = nn.Conv3d(low_channels + high_channels, low_channels, kernel_size=1)
+        self.bn = nn.BatchNorm3d(low_channels)
+        self.relu = nn.ReLU(inplace=True)
 
-        out = torch.cat((x0, x1, x2), 1)
-        out = self.ConvLinear(out)
-        short = self.shortcut(x)
-        out = out * self.scale + short
-        out = self.relu(out)
-
-        return out
-
-
-class BasicConv(nn.Module):
-    def __init__(
-        self,
-        in_planes,
-        out_planes,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        relu=True,
-        bn=True,
-        bias=False,
-    ):
-        super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv3d(
-            in_planes,
-            out_planes,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-        )
-        self.bn = (
-            nn.BatchNorm3d(out_planes, eps=1e-5, momentum=0.01, affine=True)
-            if bn
-            else None
-        )
-        self.relu = nn.ReLU(inplace=True) if relu else None
-
-    def forward(self, x):
-
+    def forward(self, low_freq, high_freq):
+        # Concatenate along channel dimension
+        x = torch.cat([low_freq, high_freq], dim=1)
         x = self.conv(x)
-
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
+        x = self.bn(x)
+        x = self.relu(x)
         return x
 
 
-class FemPlainConvUNet(nn.Module):
+class WaveletChannelAttention(nn.Module):
+    """
+    Model combining wavelet transform and channel attention for 3D CT images.
+    """
+    def __init__(self, in_channels, wavelet='haar', reduction=16):
+        super(WaveletChannelAttention, self).__init__()
+        self.wavelet_transform = WaveletTransform3D(wavelet=wavelet)
+        self.low_freq_attention = ChannelAttention(in_channels, reduction)
+        self.high_freq_attention = ChannelAttention(in_channels * 7, reduction)  # Adapted for high frequency
+
+        # Pass the correct low and high frequency channels to FeatureFusion
+        self.feature_fusion = FeatureFusion(low_channels=in_channels, high_channels=in_channels * 7)
+
+    def forward(self, x):
+        # Perform wavelet transform
+        low_freq, high_freq = self.wavelet_transform.dwt3d(x)
+
+        # Adjust high_freq shape to (B, C * 7, D, H, W)
+        B, C, N, D, H, W = high_freq.shape
+        high_freq = high_freq.view(B, C * N, D, H, W)
+
+        # Apply channel attention to low- and high-frequency components
+        low_freq = self.low_freq_attention(low_freq)
+        high_freq = self.high_freq_attention(high_freq)
+
+        # Fuse the enhanced low- and high-frequency components
+        fused_features = self.feature_fusion(low_freq, high_freq)
+
+        return fused_features
+
+
+
+class WalveAttentionPlainConvUNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -231,9 +212,10 @@ class FemPlainConvUNet(nn.Module):
         )
 
         # 初始化 FEM 模块
-        self.FEM = nn.ModuleList(
-            [FEM(features, features) for features in self.encoder.output_channels]
+        self.walveattention_net = nn.ModuleList(
+            [WaveletChannelAttention(in_channels=features) for features in self.encoder.output_channels]
         )
+        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=(2, 2, 2))
 
     def forward(self, x):
         # 编码阶段
@@ -241,15 +223,30 @@ class FemPlainConvUNet(nn.Module):
 
         # 增强 skip 连接
         enhanced_skips = []
-        for skip, fem in zip(skips, self.FEM):
+        for skip, wlve in zip(skips, self.walveattention_net):
             skip = skip.float()  # 确保输入为 float32
-            ll = fem(skip)  # 应用 FEM 模块
+            ll = wlve(skip)  # 应用 FEM 模块
+            # 上采样 从（4，4，4）上采样到（8，8，8）
+            ll = F.interpolate(ll, scale_factor=2, mode='trilinear', align_corners=False)
             enhanced_skip = ll + skip
             enhanced_skips.append(enhanced_skip)
 
         # 解码阶段
         outputs = self.decoder(enhanced_skips)
         return outputs
+        # upsampled_outputs = []  # 用于存储每层上采样后的结果
+
+        # if isinstance(outputs, list):  # 如果 decoder 返回多个输出
+        #     for output in outputs:
+        #         # 对每层输出进行上采样
+        #         upsampled_output = F.interpolate(output, scale_factor=2, mode='trilinear', align_corners=False)
+        #         upsampled_outputs.append(upsampled_output)
+        # else:
+        #     # 如果 decoder 返回单个张量，直接上采样
+        #     upsampled_outputs.append(F.interpolate(outputs, scale_factor=2, mode='trilinear', align_corners=False))
+
+        # # 返回所有上采样的结果
+        # return upsampled_outputs
 
     def compute_conv_feature_map_size(self, input_size):
         assert len(input_size) == convert_conv_op_to_dim(self.encoder.conv_op), (
@@ -439,7 +436,7 @@ class ResidualUNet(nn.Module):
 if __name__ == "__main__":
     data = torch.rand((1, 1, 128, 128, 128))
 
-    model = FemPlainConvUNet(
+    model = WalveAttentionPlainConvUNet(
         1,
         6,
         (32, 64, 125, 256, 320, 320),

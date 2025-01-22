@@ -57,11 +57,14 @@ def create_lists_from_splitted_dataset_folder(folder: str, file_ending: str, ide
 
 
 def get_filenames_of_train_images_and_targets(raw_dataset_folder: str, dataset_json: dict = None):
+    
     if dataset_json is None:
+        print("dataset_json is None" )
         dataset_json = load_json(join(raw_dataset_folder, 'dataset.json'))
 
     if 'dataset' in dataset_json.keys():
         dataset = dataset_json['dataset']
+        print(dataset.size)
         for k in dataset.keys():
             dataset[k]['label'] = os.path.abspath(join(raw_dataset_folder, dataset[k]['label'])) if not os.path.isabs(dataset[k]['label']) else dataset[k]['label']
             dataset[k]['images'] = [os.path.abspath(join(raw_dataset_folder, i)) if not os.path.isabs(i) else i for i in dataset[k]['images']]
