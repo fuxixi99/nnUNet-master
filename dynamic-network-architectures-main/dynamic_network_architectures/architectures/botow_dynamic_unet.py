@@ -10,31 +10,39 @@ from dynamic_network_architectures.building_blocks.unet_residual_decoder import 
 from dynamic_network_architectures.initialization.weight_init import InitWeights_He
 from dynamic_network_architectures.initialization.weight_init import init_last_bn_before_add_to_0
 from torch import nn
+
+import torch.nn.functional as F
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
-import pywt
-import torch.nn.functional as F
-class WaveletTransform3D(nn.Module):
-    """
-    Module to perform 3D Haar Wavelet Transform.
-    Retains only the LL (low-frequency) component.
-    """
-    def __init__(self, wavelet='haar'):
-        super(WaveletTransform3D, self).__init__()
-        self.wavelet = wavelet
+
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ASPP, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool3d(1)  # 适用于3D
+        self.conv1x1_1 = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        self.atrous_block1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, dilation=1)
+        self.atrous_block6 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=6, dilation=6)
+        self.atrous_block12 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=12, dilation=12)
+        self.atrous_block18 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=18, dilation=18)
+        self.conv1x1_2 = nn.Conv3d(out_channels * 5, out_channels, kernel_size=1)
 
     def forward(self, x):
-        x_np = x.detach().cpu().numpy()
-        coeffs = pywt.dwtn(x_np, self.wavelet, axes=(2, 3, 4))
-        LL = coeffs['aaa']
-        LL_tensor = torch.tensor(LL, dtype=x.dtype, device=x.device)
-        if len(LL_tensor.shape) == 4:
-            LL_tensor = LL_tensor.unsqueeze(1)
-        # return LL_tensor.squeeze(1)
-        return LL_tensor
+        size = x.shape[2:]  # 获取空间维度 (D, H, W)
 
+        global_avg = self.global_avg_pool(x)
+        global_avg = self.conv1x1_1(global_avg)
+        global_avg = F.interpolate(global_avg, size=size, mode="trilinear", align_corners=False)
 
-class WalvePlainConvUNet(nn.Module):
+        atrous_block1 = self.atrous_block1(x)
+        atrous_block6 = self.atrous_block6(x)
+        atrous_block12 = self.atrous_block12(x)
+        atrous_block18 = self.atrous_block18(x)
+
+        x = torch.cat([global_avg, atrous_block1, atrous_block6, atrous_block12, atrous_block18], dim=1)
+        x = self.conv1x1_2(x)
+        return x
+    
+class AsppPlainConvUNet(nn.Module):
     def __init__(self,
                  input_channels: int,
                  n_stages: int,
@@ -76,95 +84,16 @@ class WalvePlainConvUNet(nn.Module):
                                         nonlin_first=nonlin_first)
         self.decoder = UNetDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision,
                                    nonlin_first=nonlin_first)
-        self.wavelet_transform = WaveletTransform3D()
-
-        # Pooling
-        self.pool1 = nn.MaxPool3d(kernel_size=2, stride=(2, 2, 2))
-        self.conv3d1 = nn.Conv3d(in_channels=64, out_channels=32, kernel_size=3, stride=1, padding=1)
-        self.conv3d2 = nn.Conv3d(in_channels=128, out_channels=64, kernel_size=3, stride=1, padding=1)
-        self.conv3d3 = nn.Conv3d(in_channels=250, out_channels=125, kernel_size=3, stride=1, padding=1)
-        self.conv3d4 = nn.Conv3d(in_channels=512, out_channels=250, kernel_size=3, stride=1, padding=1)
-        self.conv3d5 = nn.Conv3d(in_channels=640, out_channels=320, kernel_size=3, stride=1, padding=1)
-        self.conv3d6 = nn.Conv3d(in_channels=640, out_channels=320, kernel_size=3, stride=1, padding=1)
-        self.conv3d=[]
-        self.conv3d.append(self.conv3d1)
-        self.conv3d.append(self.conv3d2)
-        self.conv3d.append(self.conv3d3)
-        self.conv3d.append(self.conv3d4)
-        self.conv3d.append(self.conv3d5)
-        self.conv3d.append(self.conv3d6)
-
+        
+        # 初始化 FEM 模块
+        self.Aspp = ASPP(320, 320)
+    
 
     def forward(self, x):
         skips = self.encoder(x)
-        enhanced_skips = []
-        i=0
-        for skip, conv3d in zip(skips,self.conv3d):
-            i+=1
-            ll = self.wavelet_transform(skip)
-            print("ll.shape",ll.shape)
-            print("skip.shape",skip.shape)
-            print("self.pool1(ll).shape",self.pool1(skip).shape)
-            
-            if i<4:
-                enhanced_skip = torch.cat([ll, self.pool1(skip)], dim=1)
-                print("before enhanced_skip.shape",enhanced_skip.shape)
-                enhanced_skip=conv3d(enhanced_skip)
-                print("after enhanced_skip.shape",enhanced_skip.shape)
-            else:
-                enhanced_skip =self.pool1(skip)
-                print("enhanced_skip.shape",enhanced_skip.shape)
-            
-            enhanced_skips.append(enhanced_skip)
-        # enhanced_skips = []
-
-        # # 进行多次小波变换
-        # ll1 = self.wavelet_transform(x)  # 第一次小波变换
-        # enhanced_skips.append(ll1)  # 保存第一次小波低频分量
-
-        # # 第二次小波变换
-        # ll2 = self.wavelet_transform(ll1)
-        # enhanced_skips.append(ll2)
-
-        # # 第三次小波变换（可以根据需要调整次数）
-        # ll3 = self.wavelet_transform(ll2)
-        # enhanced_skips.append(ll3)
-        
-
-        # # 将增强的特征通过编码器和解码器处理
-        # skips = self.encoder(x)  # 编码原始输入
-        # combined_skips = []
-        
-        # # 对应每层 skip 添加增强特征
-        # for i in range(3):
-        #     print(i,"self.pool1(skips[i].shape",self.pool1(skips[i]).shape)
-        #     print(i,"enhanced_skip.shape",enhanced_skips[i].shape)
-        #     # 特征融合：将小波特征与编码特征拼接
-        #     combined_skip = enhanced_skips[i]+ self.pool1(skips[i])
-        #     print(i,"combined_skip.shape",combined_skip.shape)
-        #     combined_skips.append(combined_skip)
-        
-        # for i in range(3,6):
-        #     combined_skips.append(skips[i])
-        #     print(i,"combined_skip.shape",combined_skips[i].shape)
-
-        # 解码阶段
-        # 解码阶段，decoder 返回一个列表（深度监督输出）
-        outputs = self.decoder(enhanced_skips)
-
-        upsampled_outputs = []  # 用于存储每层上采样后的结果
-
-        if isinstance(outputs, list):  # 如果 decoder 返回多个输出
-            for output in outputs:
-                # 对每层输出进行上采样
-                upsampled_output = F.interpolate(output, scale_factor=2, mode='trilinear', align_corners=False)
-                upsampled_outputs.append(upsampled_output)
-        else:
-            # 如果 decoder 返回单个张量，直接上采样
-            upsampled_outputs.append(F.interpolate(outputs, scale_factor=2, mode='trilinear', align_corners=False))
-
-        # 返回所有上采样的结果
-        return upsampled_outputs
+        # 增强 skip 连接
+        skips[-1]=self.Aspp(skips[-1])
+        return self.decoder(skips)
 
     def compute_conv_feature_map_size(self, input_size):
         assert len(input_size) == convert_conv_op_to_dim(self.encoder.conv_op), "just give the image size without color/feature channels or " \
@@ -292,23 +221,39 @@ class ResidualUNet(nn.Module):
 
 
 if __name__ == '__main__':
-    data = torch.rand((1, 1, 192, 192, 192))
+    data = torch.rand((1, 1, 128, 128, 128))
 
-    model = WalvePlainConvUNet(1, 6, (32, 64, 125, 256, 320, 320), nn.Conv3d, 3, (1, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2), 2,
-                                (2, 2, 2, 2, 2), False, nn.BatchNorm3d, None, None, None, nn.ReLU, deep_supervision=True)
+    model = AsppPlainConvUNet(
+        1,
+        6,
+        (32, 64, 125, 256, 320, 320),
+        nn.Conv3d,
+        3,
+        (1, 2, 2, 2, 2, 2),
+        (2, 2, 2, 2, 2, 2),
+        2,
+        (2, 2, 2, 2, 2),
+        False,
+        nn.BatchNorm3d,
+        None,
+        None,
+        None,
+        nn.ReLU,
+        deep_supervision=True,
+    )
 
-    # # if False:
-    # #     import hiddenlayer as hl
+    # if False:
+    #     import hiddenlayer as hl
 
-    # #     g = hl.build_graph(model, data,
-    # #                        transforms=None)
-    # #     g.save("network_architecture.pdf")
-    # #     del g
+    #     g = hl.build_graph(model, data,
+    #                        transforms=None)
+    #     g.save("network_architecture.pdf")
+    #     del g
 
-    # print(model.compute_conv_feature_map_size(data.shape[2:]))
+    print(model.compute_conv_feature_map_size(data.shape[2:]))
 
-    output=model(data)
+    output = model(data)
     for i in output:
         print(i.shape)
-        print("\n")
 
+    

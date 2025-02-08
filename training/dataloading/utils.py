@@ -14,6 +14,9 @@ def _convert_to_npy(npz_file: str, unpack_segmentation: bool = True, overwrite_e
                     verify_npy: bool = False, fail_ctr: int = 0) -> None:
     data_npy = npz_file[:-3] + "npy"
     seg_npy = npz_file[:-4] + "_seg.npy"
+    print("data_npy",data_npy)
+    print("seg_npy",seg_npy)
+    print("overwrite_existing",overwrite_existing)
     try:
         npz_content = None  # will only be opened on demand
 

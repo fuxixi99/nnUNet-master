@@ -90,11 +90,7 @@ from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
-from nnunetv2.training.loss.compound_losses import (
-    DC_and_CE_loss,
-    DC_and_BCE_loss,
-    DC_and_HD_loss,
-)
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss,DC_and_HD_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
@@ -109,9 +105,9 @@ from nnunetv2.utilities.label_handling.label_handling import (
     determine_num_input_channels,
 )
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+from .nnUNetTrainer import *
 
-
-class nnUNetTrainer(object):
+class NewLossnnUNetTrainer(nnUNetTrainer):
     def __init__(
         self,
         plans: dict,
@@ -138,157 +134,7 @@ class nnUNetTrainer(object):
         # https://www.osnews.com/images/comics/wtfm.jpg
         # https://i.pinimg.com/originals/26/b2/50/26b250a738ea4abc7a5af4d42ad93af0.jpg
 
-        self.is_ddp = dist.is_available() and dist.is_initialized()
-        self.local_rank = 0 if not self.is_ddp else dist.get_rank()
-
-        self.device = device
-
-        # print what device we are using
-        if self.is_ddp:  # implicitly it's clear that we use cuda in this case
-            print(
-                f"I am local rank {self.local_rank}. {device_count()} GPUs are available. The world size is "
-                f"{dist.get_world_size()}."
-                f"Setting device to {self.device}"
-            )
-            self.device = torch.device(type="cuda", index=self.local_rank)
-        else:
-            if self.device.type == "cuda":
-                # we might want to let the user pick this but for now please pick the correct GPU with CUDA_VISIBLE_DEVICES=X
-                self.device = torch.device(type="cuda", index=0)
-            print(f"Using device: {self.device}")
-
-        # loading and saving this class for continuing from checkpoint should not happen based on pickling. This
-        # would also pickle the network etc. Bad, bad. Instead we just reinstantiate and then load the checkpoint we
-        # need. So let's save the init args
-        self.my_init_kwargs = {}
-        for k in inspect.signature(self.__init__).parameters.keys():
-            self.my_init_kwargs[k] = locals()[k]
-
-        ###  Saving all the init args into class variables for later access
-        self.plans_manager = PlansManager(plans)
-        self.configuration_manager = self.plans_manager.get_configuration(configuration)
-        self.configuration_name = configuration
-        self.dataset_json = dataset_json
-        self.fold = fold
-        self.unpack_dataset = unpack_dataset
-
-        ### Setting all the folder names. We need to make sure things don't crash in case we are just running
-        # inference and some of the folders may not be defined!
-        self.preprocessed_dataset_folder_base = (
-            join(nnUNet_preprocessed, self.plans_manager.dataset_name)
-            if nnUNet_preprocessed is not None
-            else None
-        )
-        self.output_folder_base = (
-            join(
-                nnUNet_results,
-                self.plans_manager.dataset_name,
-                self.__class__.__name__
-                + "__"
-                + self.plans_manager.plans_name
-                + "__"
-                + configuration,
-            )
-            if nnUNet_results is not None
-            else None
-        )
-        self.output_folder = join(self.output_folder_base, f"fold_{fold}")
-
-        self.preprocessed_dataset_folder = join(
-            self.preprocessed_dataset_folder_base,
-            self.configuration_manager.data_identifier,
-        )
-        # unlike the previous nnunet folder_with_segs_from_previous_stage is now part of the plans. For now it has to
-        # be a different configuration in the same plans
-        # IMPORTANT! the mapping must be bijective, so lowres must point to fullres and vice versa (using
-        # "previous_stage" and "next_stage"). Otherwise it won't work!
-        self.is_cascaded = self.configuration_manager.previous_stage_name is not None
-        self.folder_with_segs_from_previous_stage = (
-            join(
-                nnUNet_results,
-                self.plans_manager.dataset_name,
-                self.__class__.__name__
-                + "__"
-                + self.plans_manager.plans_name
-                + "__"
-                + self.configuration_manager.previous_stage_name,
-                "predicted_next_stage",
-                self.configuration_name,
-            )
-            if self.is_cascaded
-            else None
-        )
-
-        ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-2
-        self.weight_decay = 3e-5
-        self.oversample_foreground_percent = 0.33
-        self.num_iterations_per_epoch = 50
-        self.num_val_iterations_per_epoch = 20
-        self.num_epochs = 300 # max_epoch
-        self.current_epoch = 0
-        self.enable_deep_supervision = True
-
-        ### Dealing with labels/regions
-        self.label_manager = self.plans_manager.get_label_manager(dataset_json)
-        # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
-        # needed for predictions. We do sigmoid in case of (overlapping) regions
-
-        self.num_input_channels = None  # -> self.initialize()
-        self.network = None  # -> self.build_network_architecture()
-        self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler() if self.device.type == "cuda" else None
-        self.loss = None  # -> self.initialize
-
-        ### Simple logging. Don't take that away from me!
-        # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
-        # logging
-        timestamp = datetime.now()
-        maybe_mkdir_p(self.output_folder)
-        self.log_file = join(
-            self.output_folder,
-            "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt"
-            % (
-                timestamp.year,
-                timestamp.month,
-                timestamp.day,
-                timestamp.hour,
-                timestamp.minute,
-                timestamp.second,
-            ),
-        )
-        self.logger = nnUNetLogger()
-
-        ### placeholders
-        self.dataloader_train = self.dataloader_val = None  # see on_train_start
-
-        ### initializing stuff for remembering things and such
-        self._best_ema = None
-
-        ### inference things
-        self.inference_allowed_mirroring_axes = None  # this variable is set in
-        # self.configure_rotation_dummyDA_mirroring_and_inital_patch_size and will be saved in checkpoints
-
-        ### checkpoint saving stuff
-        self.save_every = 40
-        self.disable_checkpointing = False
-
-        ## DDP batch size and oversampling can differ between workers and needs adaptation
-        # we need to change the batch size in DDP because we don't use any of those distributed samplers
-        self._set_batch_size_and_oversample()
-
-        self.was_initialized = False
-
-        self.print_to_log_file(
-            "\n#######################################################################\n"
-            "Please cite the following paper when using nnU-Net:\n"
-            "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
-            "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
-            "Nature methods, 18(2), 203-211.\n"
-            "#######################################################################\n",
-            also_print_to_console=True,
-            add_timestamp=False,
-        )
+        super(NewLossnnUNetTrainer, self).__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
 
     def initialize(self):
         if not self.was_initialized:
@@ -317,8 +163,8 @@ class nnUNetTrainer(object):
                 )
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
-            self.loss = self._build_loss()
-            # self.loss = self.hd_dice_loss()
+            # self.loss = self._build_loss()
+            self.loss = self.hd_dice_loss()
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
@@ -528,7 +374,6 @@ class nnUNetTrainer(object):
             self.oversample_foreground_percent = oversample_percent
 
     def _build_loss(self):
-        print("self.label_manager.has_regions:", self.label_manager.has_regions)
         if self.label_manager.has_regions:
             loss = DC_and_BCE_loss(
                 {},
@@ -542,7 +387,6 @@ class nnUNetTrainer(object):
                 dice_class=MemoryEfficientSoftDiceLoss,
             )
         else:
-            print("Using CE loss")
             loss = DC_and_CE_loss(
                 {
                     "batch_dice": self.configuration_manager.batch_dice,
@@ -582,18 +426,38 @@ class nnUNetTrainer(object):
             loss = DeepSupervisionWrapper(loss, weights)
 
         return loss
-
     def hd_dice_loss(self):
-        loss = DC_HD_loss(
-            {
-                "batch_dice": self.configuration_manager.batch_dice,
-                "do_bg": True,
-                "smooth": 1e-5,
-                "ddp": self.is_ddp,
-            },
-            ignore_label=self.label_manager.ignore_label is not None,
-            dice_class=MemoryEfficientSoftDiceLoss,
-        )
+        loss = DC_and_HD_loss(
+                {
+                    "batch_dice": self.configuration_manager.batch_dice,
+                    "smooth": 1e-5,
+                    "do_bg": False,
+                    "ddp": self.is_ddp,
+                },
+                
+                weight_hd=1,
+                weight_dice=1,
+                ignore_label=self.label_manager.ignore_label,
+                dice_class=MemoryEfficientSoftDiceLoss,
+            )
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array(
+                [1 / (2**i) for i in range(len(deep_supervision_scales))]
+            )
+            if self.is_ddp and not self._do_i_compile():
+                # very strange and stupid interaction. DDP crashes and complains about unused parameters due to
+                # weights[-1] = 0. Interestingly this crash doesn't happen with torch.compile enabled. Strange stuff.
+                # Anywho, the simple fix is to set a very low weight to this.
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            weights = weights / weights.sum()
+            # now wrap the loss
+            loss = DeepSupervisionWrapper(loss, weights)
+
         return loss
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
@@ -1272,10 +1136,8 @@ class nnUNetTrainer(object):
         # dirty hack because on_epoch_end increments the epoch counter and this is executed afterwards.
         # This will lead to the wrong current epoch to be stored
         self.current_epoch -= 1
-        save_path = join(self.output_folder, "checkpoint_final.pth")
-        print(
-            f"Training {self.current_epoch}done. Saving final checkpoint to {save_path}"
-        )
+        save_path=join(self.output_folder, "checkpoint_final.pth")
+        print(f"Training {self.current_epoch}done. Saving final checkpoint to {save_path}")
         self.save_checkpoint(save_path)
         self.current_epoch += 1
 
@@ -1520,7 +1382,7 @@ class nnUNetTrainer(object):
 
         # handling periodic checkpointing
         current_epoch = self.current_epoch
-        if current_epoch > 150 and (current_epoch + 1) % self.save_every == 0:
+        if current_epoch > 40 and current_epoch < 90 and (current_epoch + 1) % self.save_every == 0 :
             self.save_checkpoint(join(self.output_folder, f"epoch_{current_epoch}.pth"))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this

@@ -87,6 +87,10 @@ class AsppPlainConvUNet(nn.Module):
         
         # 初始化 FEM 模块
         self.Aspp = ASPP(320, 320)
+        # 初始化 FEM 模块
+        # self.Aspp = nn.ModuleList(
+        #     [ASPP(features, features) for features in self.encoder.output_channels]
+        # )
     
 
     def forward(self, x):
@@ -94,6 +98,20 @@ class AsppPlainConvUNet(nn.Module):
         # 增强 skip 连接
         skips[-1]=self.Aspp(skips[-1])
         return self.decoder(skips)
+        # 编码阶段
+        # skips = self.encoder(x)
+
+        # # 增强 skip 连接
+        # enhanced_skips = []
+        # for skip, Aspp in zip(skips, self.Aspp):
+        #     skip = skip.float()  # 确保输入为 float32
+        #     ll = Aspp(skip)  # 应用 Aspp 模块
+        #     enhanced_skip = ll + skip
+        #     enhanced_skips.append(enhanced_skip)
+
+        # # 解码阶段
+        # outputs = self.decoder(enhanced_skips)
+        # return outputs
 
     def compute_conv_feature_map_size(self, input_size):
         assert len(input_size) == convert_conv_op_to_dim(self.encoder.conv_op), "just give the image size without color/feature channels or " \
@@ -221,7 +239,7 @@ class ResidualUNet(nn.Module):
 
 
 if __name__ == '__main__':
-    data = torch.rand((1, 1, 128, 128, 128))
+    data = torch.rand((1, 1, 192, 192, 192))
 
     model = AsppPlainConvUNet(
         1,
@@ -250,7 +268,7 @@ if __name__ == '__main__':
     #     g.save("network_architecture.pdf")
     #     del g
 
-    print(model.compute_conv_feature_map_size(data.shape[2:]))
+    # print(model.compute_conv_feature_map_size(data.shape[2:]))
 
     output = model(data)
     for i in output:

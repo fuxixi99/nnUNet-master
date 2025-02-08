@@ -9,9 +9,9 @@ from dynamic_network_architectures.building_blocks.simple_conv_blocks import Sta
 from dynamic_network_architectures.building_blocks.helper import get_matching_convtransp
 from dynamic_network_architectures.building_blocks.residual_encoders import ResidualEncoder
 from dynamic_network_architectures.building_blocks.plain_conv_encoder import PlainConvEncoder
-# from dynamic_network_architectures.architectures.dynamic_unet_encoder import Dynam
+from dynamic_network_architectures.architectures.dynamic_unet_decoder import DynamicPositioningAttention3D
 
-class UNetDecoder(nn.Module):
+class DynamicUNetDecoder(nn.Module):
     def __init__(self,
                  encoder: Union[PlainConvEncoder, ResidualEncoder],
                  num_classes: int,
@@ -109,7 +109,7 @@ class UNetDecoder(nn.Module):
             x = self.transpconvs[s](lres_input)
             x = torch.cat((x, skips[-(s+2)]), 1)
             x = self.stages[s](x)
-            
+            DynamicPositioningAttention3D
 
             if self.deep_supervision:
                 seg_outputs.append(self.seg_layers[s](x))
