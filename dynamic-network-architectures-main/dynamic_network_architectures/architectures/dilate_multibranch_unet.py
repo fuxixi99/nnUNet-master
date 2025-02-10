@@ -25,76 +25,87 @@ from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 from torch.cuda.amp import autocast
 
-class FEM_Series(nn.Module):  # 并联的空洞卷积块
-    def __init__(self, in_planes, out_planes, dilation_rates=[1, 2, 4]):
-        super(FEM_Series, self).__init__()
-        self.branches = nn.ModuleList()
-        
-        # 创建不同膨胀率的空洞卷积
-        for dilation in dilation_rates:
-            self.branches.append(
-                nn.Sequential(
-                    BasicConv(in_planes, out_planes, kernel_size=3, stride=1, padding=dilation, dilation=dilation),
-                )
-            )
-        
-        # 最后的1x1卷积用于融合所有分支
-        self.ConvLinear = BasicConv(
-            len(dilation_rates) * out_planes, out_planes, kernel_size=1, stride=1, relu=False
-        )
-    
-    def forward(self, x):
-        branch_outputs = [branch(x) for branch in self.branches]
-        
-        out = torch.cat(branch_outputs, 1)  # 串联分支
-        out = self.ConvLinear(out)
-        return out
-    
-class BasicConv(nn.Module):
-    def __init__(
-        self,
-        in_planes,
-        out_planes,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        relu=True,
-        bn=True,
-        bias=False,
-    ):
-        super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv3d(
-            in_planes,
-            out_planes,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-        )
-        self.bn = (
-            nn.BatchNorm3d(out_planes, eps=1e-5, momentum=0.01, affine=True)
-            if bn
-            else None
-        )
-        self.relu = nn.ReLU(inplace=True) if relu else None
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DilationBranch3D(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation_rates=[1, 2, 4]):
+        super().__init__()
+        # 3D 空洞卷积分支
+        self.dilated_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=3, 
+                          padding=d, dilation=d, bias=False),
+                nn.BatchNorm3d(out_channels),
+                nn.ReLU(inplace=True)
+            ) for d in dilation_rates
+        ])
+        # 通道融合卷积
+        self.fusion_conv = nn.Conv3d(len(dilation_rates) * out_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
+        features = [conv(x) for conv in self.dilated_convs]
+        fused = self.fusion_conv(torch.cat(features, dim=1))
+        return fused
 
-        x = self.conv(x)
+class HybridConvBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # 普通 + 空洞混合路径
+        self.conv1 = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, 
+                      padding=5, dilation=5),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
 
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
+    def forward(self, x):
+        identity = self.skip(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x + identity
 
+class MultiBranchDilationModule3D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # 分支1：普通卷积路径
+        self.branch1 = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 分支2：纯空洞卷积路径
+        self.branch2 = DilationBranch3D(in_channels, out_channels // 2)
+        
+        # 分支3：混合卷积路径
+        self.branch3 = HybridConvBlock3D(in_channels, out_channels)
+        
+        # 特征融合
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(out_channels * 2 + out_channels // 2, out_channels, kernel_size=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
-class DilateSeriPlainConvUNet(nn.Module):
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        fused = self.fusion_conv(torch.cat([b1, b2, b3], dim=1))
+        return fused
+
+class DilateMultiBranchPlainConvUNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -163,7 +174,7 @@ class DilateSeriPlainConvUNet(nn.Module):
 
         # 初始化 FEM 模块
         self.FEM = nn.ModuleList(
-            [FEM_Series(features, features) for features in self.encoder.output_channels]
+            [MultiBranchDilationModule3D(features, features) for features in self.encoder.output_channels]
         )
 
     def forward(self, x):
@@ -199,7 +210,7 @@ class DilateSeriPlainConvUNet(nn.Module):
 if __name__ == "__main__":
     data = torch.rand((1, 1, 192, 192, 192))
 
-    model = DilateSeriPlainConvUNet(
+    model = DilateMultiBranchPlainConvUNet(
         1,
         6,
         (32, 64, 125, 256, 320, 320),
